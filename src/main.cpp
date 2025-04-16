@@ -1,25 +1,29 @@
 #include <Arduino.h>
 #include <LoRa_E220.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+
 #include <Wire.h>
-#include <TFT_eSPI.h> // ILI9341 için TFT kütüphanesi
-
-// Define the display parameters
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-#define SCREEN_ADDRESS 0x3C
-
+#include <Adafruit_ILI9341.h>
+#include <SPI.h>
+#include <math.h>
 // Define the pins for the LoRa E220 module
 #define M0 18
 #define M1 19
-#define AUX 15
-
+#define AUX 32
 #define CHANNEL 23
 
-// TFT nesnesi oluştur
-TFT_eSPI tft = TFT_eSPI();
+
+#define TFT_CS   15
+#define TFT_DC   2
+#define TFT_RST  4
+#define TFT_LED  33
+
+// 3D Çizim Değişkenleri
+// Initialize the display
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// Initialize the LoRa module
+LoRa_E220 e220ttl(&Serial2, AUX, M0, M1); // RX, TX, AUX, M0, M1
 
 struct Data
 {
@@ -31,104 +35,127 @@ struct Data
   float Gyrox;  
   float Gyroy;
   float Gyroz;
+  
   // yükseklik ve basınç
   float altitude;
   float pressure;
 };
 
-// Uçak pozisyon ve açı değişkenleri
-/*float planeX, planeY, planeAngle;
-unsigned long lastUpdateTime = 0;
+typedef struct {
+  float Gyrox, Gyroy, Gyroz;
+} GyroData;
+GyroData receivedData = {0, 0, 0};
 
-// Diğer tanımlamalar (LoRa pinleri vs.)...
-void drawPlane(int x, int y, float angle) {
-  int size = 15; // Uçak boyutu
-  float cosA = cos(angle);
-  float sinA = sin(angle);
+// Vertex yapısı (3D nokta)
+typedef struct {
+  float x, y, z;
+} Vec3;
 
-  // Uçak noktaları (üçgen)
-  int16_t points[3][2] = {
-    {0, -size},    // Burun
-    {-size, size},  // Sol kanat
-    {size, size}    // Sağ kanat
-  };
+// 2D projeksiyon için
+typedef struct {
+  int x, y;
+} Vec2;
 
-  // Noktaları döndür ve ekrana çiz
-  for (int i = 0; i < 3; i++) {
-    int16_t xRot = points[i][0] * cosA - points[i][1] * sinA;
-    int16_t yRot = points[i][0] * sinA + points[i][1] * cosA;
-    points[i][0] = x + xRot;
-    points[i][1] = y + yRot;
+// Basit uçak modelinin noktaları (gövde + kanatlar + kuyruk)
+#define NUM_VERTICES 40
+Vec3 vertices[NUM_VERTICES] = {
+  // Gövde
+  {0, -10, 40}, {5, -10, 40}, {5, -15, 40}, {0, -15, 40},
+  {25, 20, -20}, {30, 20, -20}, {30, 15, -20}, {25, 15, -20},
+
+  //Uçağın Kuyruğu
+  {15, 20, -20}, {40, 20, -20}, {35, 15, -15}, {10, 15, -15},
+  {15, 21, -20}, {40, 21, -20}, {35, 16, -15}, {10, 16, -15},
+
+   //Dikey Stabilazör
+  {26, 29, -20}, {26, 21, -20}, {23, 16, -15},
+  {28, 29, -20}, {28, 21,-20}, {25, 16,-15}
+};
+
+// Bağlantılar (line çizeceğiz)
+int edges[][2] = {
+  {0, 1}, {1, 2}, {2, 3}, {3, 0},
+  {0, 4}, {1, 5}, {2, 6}, {3, 7},
+  {4, 5}, {5, 6}, {6, 7}, {7, 4},
+
+
+  {8, 9}, {9, 10}, {10, 11}, {11, 8},
+  {8, 12}, {9, 13}, {10, 14}, {11, 15},
+  {12, 13}, {13, 14}, {14, 15}, {15, 12},
+
+  {16, 17}, {17, 18}, {18, 16}, 
+  {19,20}, {20,21}, {21,19},
+  {16,19}, {17,20}, {18,21},
+ 
+
+  
+ 
+};
+
+#define NUM_EDGES (sizeof(edges)/sizeof(edges[0]))
+
+// Dönme fonksiyonları (Euler)
+Vec3 rotate(Vec3 v, float roll, float pitch, float yaw) {
+  float x = v.x, y = v.y, z = v.z;
+
+  // Yaw (Z)
+  float cosa = cos(yaw), sina = sin(yaw);
+  float x1 = x * cosa - y * sina;
+  float y1 = x * sina + y * cosa;
+  x = x1; y = y1;
+
+  // Pitch (X)
+  cosa = cos(pitch); sina = sin(pitch);
+  float y2 = y * cosa - z * sina;
+  float z1 = y * sina + z * cosa;
+  y = y2; z = z1;
+
+  // Roll (Y)
+  cosa = cos(roll); sina = sin(roll);
+  float x2 = x * cosa + z * sina;
+  float z2 = -x * sina + z * cosa;
+  x = x2; z = z2;
+
+  return {x, y, z};
+}
+
+// 3D -> 2D projeksiyon
+Vec2 project(Vec3 v) {
+  float scale = 3.0;
+  int cx = 160, cy = 120; // ekran ortası
+  return {(int)(cx + v.x * scale), (int)(cy - v.y * scale)};
+}
+
+void drawPlane(float roll, float pitch, float yaw) {
+  Vec2 projected[NUM_VERTICES];
+
+  for (int i = 0; i < NUM_VERTICES; i++) {
+    Vec3 rotated = rotate(vertices[i], roll, pitch, yaw);
+    projected[i] = project(rotated);
   }
 
-  // Üçgen çiz
-  tft.drawLine(points[0][0], points[0][1], points[1][0], points[1][1], TFT_WHITE);
-  tft.drawLine(points[1][0], points[1][1], points[2][0], points[2][1], TFT_WHITE);
-  tft.drawLine(points[2][0], points[2][1], points[0][0], points[0][1], TFT_WHITE);
+  for (int i = 0; i < NUM_EDGES; i++) {
+    Vec2 p1 = projected[edges[i][0]];
+    Vec2 p2 = projected[edges[i][1]];
+    tft.drawLine(p1.x, p1.y, p2.x, p2.y,ILI9341_BLUE);
+    tft.fillRect(p1.x, p1.y, 2, 2, ILI9341_RED); // nokta çizimi
+  }
 }
-void updatePlane(Data data) {
-  // Zaman farkını hesapla
-  unsigned long currentTime = millis();
-  float deltaTime = (currentTime - lastUpdateTime) / 1000.0; // Saniye cinsinden
-  lastUpdateTime = currentTime;
-
-  // Açısal hızı açıya çevir (Gyro Z ekseni)
-  planeAngle += data.Gyroz * deltaTime;
-
-  // İvme verilerini pozisyona çevir (Accel X ve Y)
-  float speed = 50.0; // Hız çarpanı
-  planeX += data.Accelx * speed * deltaTime;
-  planeY += data.Accely * speed * deltaTime;
-
-  // Ekran sınırları
-  planeX = constrain(planeX, 0, tft.width());
-  planeY = constrain(planeY, 0, tft.height());
-
-  // Ekranı temizle ve uçağı çiz
-  tft.fillScreen(TFT_BLACK);
-  drawPlane(planeX, planeY, planeAngle);
-}*/
-
-// Initialize the display
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 
 
-// Initialize the LoRa module
-LoRa_E220 e220ttl(&Serial2, AUX, M0, M1); // RX, TX, AUX, M0, M1
+
 
 void setup()
 {
   Serial.begin(9600);
   delay(500);
-
-  // Start the LoRa module
   e220ttl.begin();
-  // Initialize the OLED display
-  while(!e220ttl.begin()){
-    Serial.println("LoRa Modul Baslatilamadi");
-    delay(1000);
-  }
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
-  { // Address 0x3C for 128x64
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;); // Halt if display initialization fails
-  }
+  tft.begin();
 
-  /*tft.init();
-  tft.setRotation(3); // Ekran yönünü ayarla
-  tft.fillScreen(TFT_BLACK);
-  planeX = tft.width() / 2;
-  planeY = tft.height() / 2;
-
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 10);
-  display.println("Lora Alici\nBaslatildi");
-  display.display();
-  delay(3000);*/
- 
+  pinMode(TFT_LED, OUTPUT);
+  digitalWrite(TFT_LED, HIGH);
+  tft.setRotation(1);
 
   // Print module information
   ResponseStructContainer c;
@@ -161,6 +188,7 @@ void setup()
   Serial.println(rs.code);
 
   c.close();
+
 }
 
 void loop()
@@ -173,83 +201,76 @@ void loop()
     Serial.println( "Sicaklik" + String(receivedData.temperature)+ "degC, Accelx: " + String(receivedData.Accelx)+ "m/s^2,  Accely: " + String(receivedData.Accely)+ "m/s^2,  Accelz: " + String(receivedData.Accelz) + "m/s^2 \n"+
     "Gyrox: " + String(receivedData.Gyrox) + "rad,  Gyroy: " + String(receivedData.Gyroy) +"rad,  Gyroz: " + String(receivedData.Gyroz)+"rad\n"
     "Basinç: "+ String(receivedData.pressure) +"Pa,  Yukseklik: " + String(receivedData.altitude)+"m\n");
+    delay(500);
 
-      // Uçağı güncelle
-     // updatePlane(receivedData);
+    
 
-    display.clearDisplay();
-    display.setCursor(10, 10);
-    display.setTextSize(2);
-    display.println("Sicaklik: " + String(receivedData.temperature) + "C");
-    display.display();
-    delay(2000);
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setRotation(1);
+    tft.setCursor(10, 10);
+    tft.setTextSize(1);
+    tft.println("Sicaklik:" +String(receivedData.temperature) + "C");
 
+    tft.setTextColor(ILI9341_BLUE);
+    tft.setRotation(1);
+    tft.setCursor(10, 20);
+    tft.setTextSize(1);
+    tft.println("X ekseni ivme:" +String(receivedData.Accelx) + "m/s^2 ");
+    
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("X ekseni\nivme\n\n" +  String(receivedData.Accelx) + "m/s^2 ");
-    display.display();
-    delay(2000);
+    tft.setTextColor(ILI9341_GREEN);
+    tft.setCursor(10, 30);
+    tft.setTextSize(1);
+    tft.println("Y ekseni ivme:" +String(receivedData.Accely) + "m/s^2 ");
+    
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("Y ekseni\nivme\n\n" +  String(receivedData.Accely) + "m/s^2 ");
-    display.display();
-    delay(2000);
+    tft.setTextColor(ILI9341_DARKGREY);
+    tft.setCursor(10, 40);
+    tft.setTextSize(1);
+    tft.println("Z ekseni ivme:" +String(receivedData.Accelz) + "m/s^2 ");
+  
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("Z ekseni\nivme\n\n" +  String(receivedData.Accelz) + "m/s^2 ");
-    display.display();
-    delay(2000);
+    tft.setTextColor(ILI9341_RED);
+    tft.setCursor(10, 50);
+    tft.setTextSize(1);
+    tft.println("X ekseni aci:" +String(receivedData.Gyrox) + "m/s^2 ");
+   
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.setCursor(10, 60);
+    tft.setTextSize(1);
+    tft.println("Y ekseni aci:" +String(receivedData.Gyroy) + "m/s^2 ");
+    
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("X ekseni\naci\n\n" +  String(receivedData.Gyrox) + "m/s^2 ");
-    display.display();
-    delay(2000);
+    tft.setTextColor(ILI9341_ORANGE);
+    tft.setCursor(10, 70);
+    tft.setTextSize(1);
+    tft.println("Z ekseni aci:" +String(receivedData.Gyroz) + "m/s^2 ");
+   
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("Y ekseni\naci\n\n" +  String(receivedData.Gyroy) + "m/s^2 ");
-    display.display();
-    delay(2000);
+    tft.setTextColor(ILI9341_MAGENTA);
+    tft.setCursor(10, 80);
+    tft.setTextSize(1);
+    tft.println("Basinc:" +String(receivedData.pressure/1000) + "kPa");
+    
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("Z ekseni\naci\n\n" +  String(receivedData.Gyroz) + "m/s^2 ");
-    display.display();
-    delay(2000);
-
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("Basinc:\n " +  String(receivedData.pressure/1000) + "kPa");
-    display.display();
-    delay(2000);
-
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(2);
-    display.println("Yukseklik \n" +  String(receivedData.altitude/1000) + "km");
-    display.display();
-    delay(2000);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.setCursor(10, 90);
+    tft.setTextSize(1);
+    tft.println("Yukseklik:" + String(receivedData.altitude/1000) + "km");
+    
+    drawPlane(receivedData.Gyrox, receivedData.Gyroy, receivedData.Gyroz);
+    delay(100);
+ 
   }
   else{
     Serial.println("Veri alinamadi");
-    display.clearDisplay();
-    display.setCursor(10, 10);
-    display.setTextSize(2);
-    display.println("Veri \n Alinamadi");
-    display.display();
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setTextColor(ILI9341_RED);
+    tft.setRotation(1);
+    tft.setCursor(10, 10);
+    tft.setTextSize(2);
+    tft.println("Veri \n Alinamadi");
     delay(500);
   }
   }
-
-  
